@@ -156,4 +156,4 @@ PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount) AS iqr
 ## 👤 Author
 
 **Kumar Saksham**
-[LinkedIn](https://linkedin.com/in/kumarsaksham)
+[LinkedIn](https://linkedin.com/in/kumarsaksham) |  [Tableau Public](https://public.tableau.com/app/profile/kumar.saksham2703)
