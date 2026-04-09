@@ -92,16 +92,15 @@ Vendors classified into **Low / Medium / High** risk tiers with audit priority q
 
 gst-invoice-anomaly-detection/
 │
-├── schema.py                  # PostgreSQL table definitions
-├── simulation.py              # Synthetic data generation (50K invoices)
-├── layer1_validation.py       # Rule-based integrity checks
-├── layer2_statistical.py      # Statistical anomaly detection
-├── layer3_scoring.py          # Vendor risk scoring model
-├── export.py                  # CSV export for Tableau
-├── requirements.txt           # Python dependencies
-├── tableau_exports/           # CSV files used in dashboard
+├── schema.py
+├── simulation.py
+├── layer1_validation.py
+├── layer2_statistical.py
+├── layer3_scoring.py
+├── export.py
+├── requirements.txt
+├── tableau_exports/
 └── README.md
-
 ---
 
 ## ⚙️ Setup & Run
