@@ -1,4 +1,7 @@
 # GST Invoice Anomaly Detection & Vendor Risk Scoring System
+![Python](https://img.shields.io/badge/Python-3.x-blue)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?logo=postgresql)
+![Tableau](https://img.shields.io/badge/Tableau-E97627?logo=tableau)
 
 An end-to-end analytics system that detects anomalous GST invoice patterns and scores vendor risk using a 3-layer detection pipeline built with Python, SQL, and PostgreSQL — visualized through an interactive Tableau dashboard.
 
