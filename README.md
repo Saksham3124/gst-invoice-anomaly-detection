@@ -160,3 +160,9 @@ PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount) AS iqr
 
 **Kumar Saksham**
 [LinkedIn](https://linkedin.com/in/kumarsaksham) |  [Tableau Public](https://public.tableau.com/app/profile/kumar.saksham2703)
+
+---
+
+## ⭐ Support
+
+If you found this project useful, consider giving it a **star** on GitHub — it means a lot! ⭐
