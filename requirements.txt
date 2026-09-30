@@ -5,3 +5,7 @@ psycopg2-binary==2.9.11
 python-dateutil==2.9.0.post0
 six==1.17.0
 tzdata==2026.1
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+google-genai>=2.0.0
+pytest>=8.0.0

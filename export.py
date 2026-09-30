@@ -1,13 +1,22 @@
+import os
+from dotenv import load_dotenv
 import psycopg2
 import pandas as pd
-import os
+
+load_dotenv()
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "gst_analytics")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 conn = psycopg2.connect(
-    dbname="gst_analytics",
-    user="postgres",
-    password="Saksham@3124",
-    host="localhost",
-    port="5432"
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=DB_PORT
 )
 
 output_dir = "tableau_exports"
@@ -150,6 +159,32 @@ query = """
 df = pd.read_sql(query, conn)
 df.to_csv(f"{output_dir}/category_risk.csv", index=False)
 print(f"    Exported: category_risk.csv")
+
+# ── Export 7: AI Risk Narratives (Layer 4) ────────────
+print("\n[7] Exporting AI risk narratives (if available)...")
+try:
+    narrative_query = """
+        SELECT
+            n.vendor_id,
+            v.vendor_name,
+            v.category,
+            n.risk_tier,
+            n.composite_score,
+            n.risk_summary,
+            array_to_string(n.key_drivers, ' | ') AS key_drivers,
+            array_to_string(n.investigation_priorities, ' | ') AS investigation_priorities,
+            array_to_string(n.evidence, ' | ') AS evidence,
+            n.model_name,
+            n.generated_at
+        FROM ai_risk_narratives n
+        LEFT JOIN vendors v ON n.vendor_id = v.vendor_id
+        ORDER BY n.composite_score DESC
+    """
+    df_narratives = pd.read_sql(narrative_query, conn)
+    df_narratives.to_csv(f"{output_dir}/ai_risk_narratives.csv", index=False)
+    print(f"    Exported: ai_risk_narratives.csv ({len(df_narratives)} records)")
+except Exception as e:
+    print(f"    Note: ai_risk_narratives table not yet populated or available ({e}). Skipping export.")
 
 conn.close()
 

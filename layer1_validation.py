@@ -1,12 +1,22 @@
+import os
+from dotenv import load_dotenv
 import psycopg2
 import re
 
+load_dotenv()
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "gst_analytics")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
 conn = psycopg2.connect(
-    dbname="gst_analytics",
-    user="postgres",
-    password="Saksham@3124",
-    host="localhost",
-    port="5432"
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASSWORD,
+    host=DB_HOST,
+    port=DB_PORT
 )
 cur = conn.cursor()
 

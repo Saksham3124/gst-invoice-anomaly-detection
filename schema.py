@@ -53,4 +53,18 @@ CREATE TABLE vendor_risk_scores (
     scored_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Layer 4: AI Risk Narratives (generated explainable decision support)
+CREATE TABLE ai_risk_narratives (
+    narrative_id             SERIAL PRIMARY KEY,
+    vendor_id                INT REFERENCES vendors(vendor_id),
+    risk_tier                VARCHAR(10) NOT NULL,
+    composite_score          DECIMAL(5,2) NOT NULL,
+    risk_summary             TEXT NOT NULL,
+    key_drivers              TEXT[] NOT NULL,
+    investigation_priorities TEXT[] NOT NULL,
+    evidence                 TEXT[] NOT NULL,
+    model_name               VARCHAR(50) NOT NULL,
+    generated_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 """
