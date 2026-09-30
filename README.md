@@ -1,465 +1,775 @@
-# GST Invoice Anomaly Detection & Vendor Risk Scoring System
+# GST Invoice Anomaly Detection & Vendor Risk Scoring
 
-[![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
-[![Tableau](https://img.shields.io/badge/Tableau-Public-E97627?logo=tableau&logoColor=white)](https://public.tableau.com/app/profile/kumar.saksham2703/viz/GST__/Dashboard1)
-[![Gemini](https://img.shields.io/badge/Google%20Gemini-2.5%20Flash-8E75C2?logo=google&logoColor=white)](https://ai.google.dev/)
-[![Tests](https://img.shields.io/badge/Pytest-11%20Passed-brightgreen?logo=pytest&logoColor=white)](tests/)
+An end-to-end GST invoice analytics and vendor risk assessment system built with **Python, PostgreSQL, statistical anomaly detection, Gemini AI, and Tableau**.
 
-An end-to-end GST invoice analytics system that validates transactional integrity, detects statistical anomalies, computes deterministic vendor risk scores, and generates AI-assisted risk narratives for audit investigation.
+The project processes **50,000+ GST invoice records across 210 vendors**, detects deterministic validation failures and statistical anomalies, calculates vendor-level risk scores, and uses Gemini AI to generate structured risk narratives that explain the already-computed risk signals.
 
----
+The architecture follows:
 
-## 📈 Key Results
+> **DETECT → SCORE → EXPLAIN**
 
-| Metric | Value | Description |
-|---|---|---|
-| **Total Invoices Processed** | `50,000` | Multi-year simulated transactional dataset (2022–2024) |
-| **Vendors Analyzed** | `210` | Unique vendors across 10 major Indian states and industry sectors |
-| **Flagged Invoices** | `7,512` | Total invoices triggering one or more validation or statistical rules |
-| **Overall Flag Rate** | `15.02%` | Baseline anomaly proportion across the full invoice population |
-| **HIGH Risk Vendors** | `35` | Vendors with composite risk score $\ge 35.0$ requiring priority audit |
-| **Distinct Flag Types** | `5` | `DUPLICATE`, `GSTIN_MISMATCH`, `INVALID_AMOUNT`, `STATISTICAL_ZSCORE`, `ROLLING_SPIKE`, `IQR_OUTLIER` |
-| **Total Discrepant Tax** | `₹2.38B` | Tax claimed on flagged invoices across all risk tiers |
+- **DETECT** — identify invoice validation failures and statistical anomalies.
+- **SCORE** — calculate deterministic vendor risk scores from validated signals.
+- **EXPLAIN** — use Gemini AI to explain the deterministic risk signals and suggest investigation priorities.
 
 ---
 
-## 📊 Dashboard
+## Project Overview
 
-An interactive dashboard deployed on Tableau Public provides multi-level drill-downs from aggregate executive KPIs to category distributions and individual high-risk vendor profiles.
+Traditional anomaly detection can identify suspicious records, but turning those signals into an understandable vendor-level risk assessment requires multiple analytical layers.
 
-👉 **[View Live Interactive Dashboard on Tableau Public](https://public.tableau.com/app/profile/kumar.saksham2703/viz/GST__/Dashboard1)**
+This project combines:
 
-![GST Invoice Risk Dashboard](dashboard.png)
+1. Deterministic invoice validation
+2. Statistical anomaly detection
+3. Vendor-level risk scoring
+4. AI-generated risk narratives
+5. Tableau-based visualization
 
----
+The system is designed so that the AI layer **does not determine fraud or risk**.
 
-## 🏗️ Architecture Overview
+The authoritative risk tier and composite score are calculated by the deterministic Layer 3 scoring engine.
 
-The pipeline implements a strict 4-layer architecture ensuring that statistical anomaly detection and numerical risk scoring remain 100% deterministic and authoritative. Layer 4 acts exclusively as an explainable decision-support interface.
+Gemini only explains those validated signals.
+
+### Architecture
 
 ```text
-Raw Data Simulation (simulation.py)
-        ↓
-Layer 0 — Relational Storage (PostgreSQL: vendors, invoices, gst_categories)
-        ↓
-Layer 1 — Rule-Based Validation (layer1_validation.py)
-        ↓
-Layer 2 — Statistical Anomaly Detection (layer2_statistical.py)
-        ↓
-Layer 3 — Deterministic Vendor Risk Scoring (layer3_scoring.py)
-        ↓
-Layer 4 — AI-Assisted Risk Narrative (ai_risk_narrative.py)
-        ↓
-Tableau Analytics & Audit Reporting (export.py → tableau_exports/)
-```
-
-- **Layers 1–3**: Perform deterministic rule validation, window-based outlier calculations, and mathematical composite scoring.
-- **Layer 4**: Translates already-validated quantitative signals into structured, human-readable risk narratives.
-- **Downstream**: Prepares denormalized CSV extracts tailored for Tableau dashboards and audit worklists.
-
----
-
-## 🎯 Problem Statement
-
-Goods and Services Tax (GST) ecosystems process millions of business-to-business (B2B) invoices monthly. Manual invoice-by-invoice audits are computationally infeasible, while simplistic rule checks miss subtle statistical patterns such as gradual baseline creep, rolling volume spikes, and category-level pricing deviations.
-
-This project delivers an automated, scalable pipeline that:
-1. Filters overt data integrity flaws (duplicates, state-code mismatches, negative tax).
-2. Quantifies behavioral deviations using window functions and interquartile fencing.
-3. Aggregates multi-dimensional signals into an authoritative, normalized vendor risk score.
-4. Generates concise, evidence-grounded risk narratives via the Gemini API to streamline investigator triaging.
-
----
-
-## 🔍 Layer Breakdown
-
-### Layer 1 — Rule-Based Validation (`layer1_validation.py`)
-Executes deterministic validation checks directly in PostgreSQL and marks invoices as `CLEAN` or `FLAGGED`:
-- **Duplicate Detection**: Flags identical billing instances sharing `(vendor_id, amount, invoice_date)` (`DUPLICATE`, Medium severity).
-- **GSTIN State-Code Validation**: Verifies that the outward supply `state_code` matches the 2-digit state prefix of the vendor's registered GSTIN (`GSTIN_MISMATCH`, High severity).
-- **Amount & Tax Integrity**: Rejects non-positive invoice amounts ($\le 0$) and negative tax claims (`INVALID_AMOUNT`, High severity).
-- **Completeness Checks**: Validates non-null constraints across critical fields (`invoice_id`, `vendor_id`, `invoice_date`, `amount`).
-
-### Layer 2 — Statistical Anomaly Detection (`layer2_statistical.py`)
-Applies statistical SQL window functions across validated `CLEAN` invoices to uncover subtle behavioral outliers:
-- **Baseline Deviation (Z-Score)**:
-  Computes historical vendor baseline ($\mu$) and standard deviation ($\sigma$). Flags transactions deviating $> 2\sigma$ (`STATISTICAL_ZSCORE`, Medium) and $> 3\sigma$ (High severity):
-  $$\text{Z-Score} = \frac{\text{Amount} - \mu_{\text{vendor}}}{\sigma_{\text{vendor}}}$$
-- **Rolling Average Spike Detection**:
-  Calculates a trailing moving average over a **30-invoice window** (`ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING`). Flags invoices exceeding $3\times$ their recent trailing baseline (`ROLLING_SPIKE`, High severity).
-- **Category IQR Outlier Detection**:
-  Calculates category-specific quartiles ($Q_1$, $Q_3$) using `PERCENTILE_CONT`. Identifies transactions exceeding the upper fence:
-  $$\text{Upper Fence} = Q_3 + 1.5 \times (Q_3 - Q_1)$$
-  Flagged as `IQR_OUTLIER` (Medium severity).
-
-### Layer 3 — Deterministic Vendor Risk Scoring (`layer3_scoring.py`)
-Computes four normalized signals ($0-100$ scale) for each vendor and generates an authoritative composite risk score:
-
-| Signal | Weight | Metric Definition |
-|---|---|---|
-| **Anomaly Frequency** | `30%` | Flagged Invoices $\div$ Total Invoices ($\times 100$) |
-| **Deviation Magnitude** | `30%` | Normalized average Z-score of statistical outliers |
-| **Validation Failures** | `20%` | High-severity flags $\div$ Total Invoices ($\times 100$) |
-| **Recency Trend** | `20%` | Ratio of recent flags (last 6 months) vs. historical flags |
-
-$$\text{Composite Score} = 0.30 \times \text{Freq} + 0.30 \times \text{Mag} + 0.20 \times \text{Val} + 0.20 \times \text{Rec}$$
-
-**Authoritative Risk Tiers**:
-- 🔴 **HIGH**: Composite Score $\ge 35.0$ (35 vendors)
-- 🟡 **MEDIUM**: Composite Score $\ge 20.0$ and $< 35.0$ (126 vendors)
-- 🟢 **LOW**: Composite Score $< 20.0$ (49 vendors)
-
-Scores are persisted to `vendor_risk_scores`. Layer 3 remains the final numerical authority.
-
-### Layer 4 — AI-Assisted Risk Narrative (`ai_risk_narrative.py`)
-Consumes already-validated evidence for high-risk vendors and calls the Google Gemini API (via the official `google-genai` SDK) to generate structured audit summaries:
-- **Input Grounding**: Sends deterministic metrics (composite score, sub-scores, flag rate, and itemized flag type breakdown).
-- **Structured Schema**: Validated via Pydantic model (`risk_summary`, `key_drivers`, `investigation_priorities`, `evidence`).
-- **Target Selection**: Defaults to `AI_RISK_TIERS=HIGH`; supports multi-tier configuration (`HIGH,MEDIUM`).
-- **Storage Isolation**: Persisted independently into `ai_risk_narratives`, preserving an immutable snapshot of the score and tier at time of generation.
-
----
-
-## 🛡️ Critical AI Boundary & Governance
-
-> [!IMPORTANT]
-> **Gemini operates strictly as an explainable decision-support layer.**
->
-> - **No Autonomous Decisions**: Gemini does NOT detect fraud, calculate anomaly scores, compute vendor risk scores, or assign risk tiers.
-> - **No Classification Overrides**: The AI cannot alter, override, or adjust the deterministic `HIGH`, `MEDIUM`, or `LOW` classifications established by Layer 3.
-> - **No Legal Accusations**: System instructions explicitly prohibit the model from asserting that a taxpayer committed fraud, tax evasion, or intentional illegality. Findings are framed strictly as anomalous patterns warranting audit verification.
-> - **Grounded in Validated Evidence**: Narratives cite only facts, counts, and metrics explicitly provided in the payload. Speculative or hallucinated business activities are strictly constrained.
-
----
-
-## 🛠️ Tech Stack
-
-| Tool / Technology | Purpose |
-|---|---|
-| **Python 3.12** | Core data pipelines, statistical modeling, API orchestration, and test framework |
-| **PostgreSQL 17** | Relational data warehouse, transactional schema, and relational integrity |
-| **SQL** | Window functions (`AVG OVER`, `STDDEV OVER`), CTEs, rolling frames, and `PERCENTILE_CONT` |
-| **Google Gemini API** | LLM inference (`gemini-2.5-flash`) via the official `google-genai` SDK |
-| **Pydantic v2** | Strict schema validation and serialization of structured AI outputs |
-| **Pandas & NumPy** | In-memory data transformation, metric aggregations, and CSV export generation |
-| **Faker** | Generation of realistic Indian commercial vendor identities and GSTINs |
-| **Tableau Public** | Interactive analytics dashboard and visual risk exploration |
-| **Pytest** | Automated unit and integration testing suite with mocked LLM/DB interfaces |
-
----
-
-## 🗄️ Database Schema
-
-The relational schema ([schema.py](schema.py)) isolates transactional records, flags, deterministic scores, and AI explanations:
-
-```sql
--- Master tables
-CREATE TABLE vendors (...);
-CREATE TABLE gst_categories (...);
-CREATE TABLE invoices (...);
-
--- Anomaly flags generated by Layers 1 & 2
-CREATE TABLE flags (
-    flag_id     SERIAL PRIMARY KEY,
-    invoice_id  VARCHAR(20) REFERENCES invoices(invoice_id),
-    vendor_id   INT REFERENCES vendors(vendor_id),
-    flag_type   VARCHAR(50) NOT NULL,
-    severity    VARCHAR(10) NOT NULL,
-    flag_date   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    details     TEXT
-);
-
--- Authoritative scores generated by Layer 3
-CREATE TABLE vendor_risk_scores (
-    vendor_id           INT REFERENCES vendors(vendor_id),
-    anomaly_frequency   DECIMAL(5,2),
-    deviation_magnitude DECIMAL(10,4),
-    validation_failures DECIMAL(5,2),
-    recency_score       DECIMAL(5,2),
-    composite_score     DECIMAL(5,2),
-    risk_tier           VARCHAR(10),
-    scored_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Layer 4: AI Risk Narratives (isolated decision-support storage)
-CREATE TABLE ai_risk_narratives (
-    narrative_id             SERIAL PRIMARY KEY,
-    vendor_id                INT REFERENCES vendors(vendor_id),
-    risk_tier                VARCHAR(10) NOT NULL,
-    composite_score          DECIMAL(5,2) NOT NULL,
-    risk_summary             TEXT NOT NULL,
-    key_drivers              TEXT[] NOT NULL,
-    investigation_priorities TEXT[] NOT NULL,
-    evidence                 TEXT[] NOT NULL,
-    model_name               VARCHAR(50) NOT NULL,
-    generated_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+                    GST Invoice Data
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │ Layer 1: Validation     │
+              │                        │
+              │ Rule-based checks      │
+              │ GSTIN mismatches       │
+              │ Duplicates             │
+              │ Invalid values         │
+              │ Structural validation  │
+              └────────────┬───────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │ Layer 2: Anomaly       │
+              │ Detection              │
+              │                        │
+              │ Z-score anomalies      │
+              │ IQR outliers           │
+              │ Rolling spikes         │
+              │ Statistical signals    │
+              └────────────┬───────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │ Layer 3: Risk Scoring  │
+              │                        │
+              │ Deterministic scoring  │
+              │ Vendor aggregation     │
+              │ Risk tier assignment   │
+              └────────────┬───────────┘
+                           │
+                           ▼
+              ┌────────────────────────┐
+              │ Layer 4: Gemini AI     │
+              │ Risk Narrative         │
+              │                        │
+              │ Explain signals        │
+              │ Summarize evidence     │
+              │ Suggest investigation  │
+              │ priorities             │
+              └────────────┬───────────┘
+                           │
+                           ▼
+                 PostgreSQL / CSV
+                           │
+                           ▼
+                    Tableau Dashboard
 ```
 
 ---
 
-## 📊 Tableau Exports
+# Key Results
 
-Running `export.py` extracts 7 curated datasets into the `tableau_exports/` directory:
+| Metric | Result |
+|---|---:|
+| Invoice records analyzed | 50,000+ |
+| Vendors analyzed | 210 |
+| Current HIGH-risk vendors | 32 |
+| Current MEDIUM-risk vendors | 115 |
+| Current LOW-risk vendors | 63 |
+| Automated Layer 4 tests | 22 passing |
+| Layer 4 AI narratives | 32 |
+| Tableau AI narratives connected | 32 |
+| Tableau dashboard worksheets | 8 |
 
-| Export File | Records | Primary Usage |
-|---|---|---|
-| `kpi_overview.csv` | 1 | Executive summary card metrics (total volume, gross tax, flag rate) |
-| `flags_breakdown.csv` | 6 | Anomaly volume, severity distribution, and vendor counts by flag type |
-| `monthly_trends.csv` | 36 | 3-year monthly time-series of invoice volume vs. flagged volume |
-| `vendor_risk_scores.csv` | 210 | Deterministic composite scores, normalized sub-signals, and risk tiers |
-| `invoice_detail.csv` | 50,000 | Invoice-level records with joined category rates and flag descriptions |
-| `category_risk.csv` | 10 | Sector-level risk profiles, average invoice values, and discrepancy rates |
-| `ai_risk_narratives.csv` | Dynamic | AI-generated risk summaries, key drivers, and prioritized audit steps |
+The current Layer 3 risk distribution is:
+
+```text
+HIGH      32
+MEDIUM   115
+LOW       63
+```
+
+The AI narrative layer currently generates narratives for the configured **HIGH-risk vendors**.
 
 ---
 
-## 📁 Project Structure
+# Layer 1 — Deterministic Invoice Validation
+
+The first layer performs rule-based validation of invoice records.
+
+Examples include:
+
+- GSTIN validation
+- Duplicate invoice detection
+- Invalid or missing values
+- Structural validation
+- Rule-based consistency checks
+- Other configured invoice-level validation rules
+
+The output of Layer 1 becomes the foundation for subsequent analytical layers.
+
+The objective is to establish reliable and reproducible invoice-level signals before statistical analysis or vendor scoring.
+
+---
+
+# Layer 2 — Statistical Anomaly Detection
+
+Layer 2 identifies unusual invoice behavior using statistical methods.
+
+Implemented techniques include:
+
+### Z-score analysis
+
+Identifies observations that deviate significantly from expected distributions.
+
+### IQR outlier detection
+
+Identifies observations outside the interquartile range.
+
+### Rolling spike detection
+
+Identifies unusually large changes relative to historical invoice behavior.
+
+These statistical signals are stored alongside the deterministic validation results and are later aggregated at the vendor level.
+
+---
+
+# Layer 3 — Deterministic Vendor Risk Scoring
+
+Layer 3 converts invoice-level signals into a vendor-level risk score.
+
+The composite score uses four deterministic components:
+
+| Component | Weight |
+|---|---:|
+| Anomaly frequency | 30% |
+| Deviation magnitude | 30% |
+| Validation failures | 20% |
+| Recency | 20% |
+
+Risk tiers are assigned using deterministic thresholds:
 
 ```text
-gst-invoice-anomaly-detection/
-├── schema.py                   # PostgreSQL DDL schema definition (Tables: Layers 0-4)
-├── simulation.py               # Data generator (50,000 invoices + realistic anomalies)
-├── layer1_validation.py        # Layer 1: Rule-based validation & GSTIN verification
-├── layer2_statistical.py       # Layer 2: Statistical outliers (Z-Score, Rolling, IQR)
-├── layer3_scoring.py           # Layer 3: Authoritative vendor risk scoring & tiering
-├── ai_risk_narrative.py        # Layer 4: Gemini-powered structured risk narratives
-├── export.py                   # Data export pipeline generating CSVs for Tableau
+HIGH       >= 35
+MEDIUM     >= 20
+LOW        < 20
+```
+
+The scoring engine is the **authoritative source of risk classification**.
+
+Gemini does not modify these scores or tiers.
+
+---
+
+# Layer 4 — Gemini AI Risk Narrative
+
+Layer 4 adds an explanation layer on top of the deterministic risk engine.
+
+Gemini receives validated vendor-level signals such as:
+
+- Vendor ID
+- Vendor name
+- Risk tier
+- Composite risk score
+- Anomaly frequency
+- Deviation magnitude
+- Validation failures
+- Recency score
+- Total invoices
+- Flagged invoices
+- Invoice flag rate
+- Relevant anomaly counts and types
+
+The model generates structured information including:
+
+- Risk summary
+- Key drivers
+- Investigation priorities
+- Evidence
+
+### Important Design Principle
+
+Gemini is an **explanation layer**, not a risk-scoring engine.
+
+```text
+Layer 1 → DETECT
+Layer 2 → DETECT
+Layer 3 → SCORE
+Layer 4 → EXPLAIN
+```
+
+Gemini does **not**:
+
+- Detect fraud independently
+- Calculate the composite risk score
+- Assign the HIGH/MEDIUM/LOW tier
+- Modify the deterministic score
+- Override Layer 3 results
+- Invent supporting evidence
+
+This separation keeps the risk calculation reproducible and auditable while allowing the dashboard to provide human-readable explanations.
+
+---
+
+# Example AI Risk Narrative
+
+For a high-risk vendor, the dashboard can surface information such as:
+
+```text
+AI RISK NARRATIVE
+
+Vaidya-Dhawan
+
+HIGH · Score 52.29
+
+RISK SUMMARY
+
+Vaidya-Dhawan has been deterministically assigned a HIGH risk
+tier with a composite score of 52.29 out of 100.0.
+
+KEY DRIVERS
+
+• Critical validation failures score of 100.0 out of 100.0
+• High anomaly frequency score of 82.14 out of 100.0
+• Presence of high-severity rolling spikes and GSTIN mismatches
+
+INVESTIGATION PRIORITIES
+
+• Review invoices flagged for GSTIN mismatches.
+• Examine invoices identified with rolling spikes.
+
+EVIDENCE
+
+Score: 52.29 | Total Invoices: 355 |
+Flagged Invoices: 127 (35.77%)
+
+Validation Score: 100.0 | Anomaly Score: 82.1
+```
+
+The narrative is generated from the deterministic Layer 3 signals.
+
+---
+
+# Tableau Dashboard
+
+The project includes an interactive Tableau dashboard combining the analytical layers.
+
+### Dashboard components
+
+- KPI cards
+- Monthly revenue trend
+- Top risky vendors
+- Risk by category
+- AI Risk Narrative panel
+
+The AI panel is connected to the vendor risk table using:
+
+```text
+vendor_risk_scores.vendor_id
+        =
+ai_risk_narratives.vendor_id
+```
+
+The dashboard uses a **logical relationship** rather than a physical cross-join.
+
+This preserves the underlying invoice and vendor row counts.
+
+### Dashboard interaction
+
+Selecting a vendor from **Top Risky Vendors** updates the AI Risk Narrative panel.
+
+For example:
+
+```text
+Top Risky Vendors
+       │
+       │ Vendor selection
+       ▼
+AI Risk Narrative
+```
+
+The panel displays the corresponding:
+
+- Vendor
+- Risk tier
+- Composite score
+- Risk summary
+- Key drivers
+- Investigation priorities
+- Evidence
+
+When no vendor is selected, the panel defaults to the highest-ranked vendor.
+
+---
+
+# Tableau Data
+
+The project exports the following datasets for Tableau:
+
+```text
+tableau_exports/
+│
+├── ai_risk_narratives.csv
+├── category_risk.csv
+├── flags_breakdown.csv
+├── invoice_detail.csv
+├── kpi_overview.csv
+├── monthly_trends.csv
+└── vendor_risk_scores.csv
+```
+
+### `ai_risk_narratives.csv`
+
+Contains the structured Layer 4 output:
+
+```text
+vendor_id
+vendor_name
+category
+risk_tier
+composite_score
+risk_summary
+key_drivers
+investigation_priorities
+evidence
+model_name
+generated_at
+```
+
+---
+
+# Project Structure
+
+```text
+GST/
+│
+├── ai_risk_narrative.py
+├── export.py
+│
+├── layer1_validation.py
+├── layer2_statistical.py
+├── layer3_scoring.py
+│
+├── schema.py
+├── simulation.py
+│
 ├── tests/
-│   ├── __init__.py
-│   └── test_ai_risk_narrative.py # Pytest test suite (11 unit tests)
-├── tableau_exports/            # Exported CSV datasets consumed by Tableau
+│   └── test_ai_risk_narrative.py
+│
+├── tableau_exports/
+│   ├── ai_risk_narratives.csv
 │   ├── category_risk.csv
 │   ├── flags_breakdown.csv
 │   ├── invoice_detail.csv
 │   ├── kpi_overview.csv
 │   ├── monthly_trends.csv
-│   ├── vendor_risk_scores.csv
-│   └── ai_risk_narratives.csv
-├── dashboard.png               # High-resolution dashboard preview
-├── dashboard.twbx              # Packaged Tableau workbook
-├── requirements.txt            # Python package dependencies
-├── .env.example                # Template for environment configuration
-├── .gitignore                  # Git ignore rules (.env, venv, caches)
-└── README.md                   # Project documentation
+│   └── vendor_risk_scores.csv
+│
+├── dashboard.twbx
+├── dashboard.png
+│
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
 ```
 
 ---
 
-## ⚙️ Configuration & Environment Variables
+# Technology Stack
 
-All credentials and runtime settings are loaded through environment variables.
+### Programming & Analytics
 
-### 1. Initialize Local Environment File
-Copy `.env.example` to create your untracked `.env` file:
+- Python
+- Pandas
+- NumPy
+- SQL
+- PostgreSQL
+
+### Statistical Analysis
+
+- Z-score analysis
+- IQR outlier detection
+- Rolling-window analysis
+- Statistical anomaly detection
+
+### Data Engineering
+
+- ETL/ELT
+- PostgreSQL
+- Data validation
+- Automated testing
+- Environment-based configuration
+
+### AI
+
+- Google Gemini API
+- Structured AI output
+- Gemini risk narrative generation
+
+### Visualization
+
+- Tableau
+- CSV-based Tableau exports
+- Interactive dashboard filtering
+
+### Testing
+
+- Pytest
+- Mocked Gemini API responses
+- Database-level validation
+- Quota-aware API handling
+
+---
+
+# Layer 4 Reliability Features
+
+The AI pipeline was designed to remain safe and resumable when API availability or quota becomes an issue.
+
+Implemented features include:
+
+### Quota-aware execution
+
+Daily Gemini quota exhaustion is detected and stops the batch rather than repeatedly sending failed requests.
+
+### Bounded retries
+
+Temporary `429` and `503` responses can be retried with bounded backoff.
+
+Permanent errors such as invalid configuration or unavailable models fail without unnecessary retries.
+
+### Resume support
+
+Already-generated valid narratives are skipped.
+
+This allows the pipeline to resume without regenerating previously successful results.
+
+### Validation before regeneration
+
+Existing narratives can be regenerated when their stored risk tier or composite score no longer matches the current Layer 3 result.
+
+### Dry-run mode
+
+The pipeline supports:
 
 ```bash
-cp .env.example .env
+python ai_risk_narrative.py --dry-run
 ```
 
-### 2. Configure Settings
-Populate `.env` with your local credentials:
+This checks eligible vendors and remaining work without making Gemini API calls or modifying the database.
+
+### Controlled execution
+
+A limited run can be performed with:
+
+```bash
+python ai_risk_narrative.py --limit 1
+```
+
+This is useful for validating the live API connection before processing the remaining vendors.
+
+---
+
+# Testing
+
+Layer 4 includes automated tests covering:
+
+- Gemini API response handling
+- Structured output validation
+- Daily quota detection
+- `429` retry behavior
+- `503` retry behavior
+- Immediate stop on exhausted daily quota
+- Existing narrative detection
+- Invalid narrative regeneration
+- Layer 3 score/tier mismatch detection
+- Resume behavior
+- `--limit`
+- `--dry-run`
+- Database write behavior
+- Zero API calls during dry runs
+
+Current test result:
+
+```text
+22 passed
+```
+
+Run the Layer 4 test suite with:
+
+```bash
+python -m pytest tests/test_ai_risk_narrative.py
+```
+
+---
+
+# Configuration
+
+Create a local `.env` file from `.env.example`.
+
+Example:
 
 ```env
-# Gemini API Configuration
-GEMINI_API_KEY=your_actual_gemini_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=gemini-3.8-flash
+
 AI_RISK_TIERS=HIGH
 
-# PostgreSQL Database Configuration
 DB_HOST=localhost
 DB_PORT=5432
-DB_NAME=gst_analytics
-DB_USER=postgres
+DB_NAME=your_database
+DB_USER=your_database_user
 DB_PASSWORD=your_database_password
 ```
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `GEMINI_API_KEY` | *(Required for Layer 4)* | Google Gemini API key. Never committed to version control. |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model variant used for structured narrative generation. |
-| `AI_RISK_TIERS` | `HIGH` | Target tiers for Layer 4 (`HIGH` or `HIGH,MEDIUM`). |
-| `DB_HOST` | `localhost` | PostgreSQL host address. |
-| `DB_PORT` | `5432` | PostgreSQL listening port. |
-| `DB_NAME` | `gst_analytics` | PostgreSQL database name. |
-| `DB_USER` | `postgres` | Database username. |
-| `DB_PASSWORD` | *(None)* | Database password. |
+The `.env` file is excluded from Git through `.gitignore`.
+
+Never commit API keys or database credentials.
 
 ---
 
-## 🚀 Setup & Pipeline Execution
+# Running the Pipeline
 
-### Prerequisites
-- Python 3.12+
-- PostgreSQL 14+
-- Tableau Desktop or Tableau Public (to inspect `.twbx`)
-
-### 1. Clone & Set Up Virtual Environment
+## 1. Install dependencies
 
 ```bash
-git clone https://github.com/Saksham3124/gst-invoice-anomaly-detection.git
-cd gst-invoice-anomaly-detection
-
-# Create and activate virtual environment
-python -m venv gst_env
-
-# Windows:
-gst_env\Scripts\activate
-
-# macOS / Linux:
-source gst_env/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Configure Database & Environment
-1. Create a PostgreSQL database named `gst_analytics`.
-2. Configure `.env` with your database credentials and `GEMINI_API_KEY`.
-3. Execute table creation:
-   ```bash
-   python -c "import psycopg2, os; from dotenv import load_dotenv; from schema import schema_sql; load_dotenv(); conn = psycopg2.connect(dbname=os.getenv('DB_NAME'), user=os.getenv('DB_USER'), password=os.getenv('DB_PASSWORD'), host=os.getenv('DB_HOST'), port=os.getenv('DB_PORT')); cur = conn.cursor(); cur.execute(schema_sql); conn.commit(); conn.close(); print('Schema created successfully.')"
-   ```
-
-### 3. Run Pipeline Sequentially
+## 2. Run Layer 1
 
 ```bash
-# Step 1: Simulate master vendors and 50,000 invoices with injected anomalies
-python simulation.py
-
-# Step 2: Run Layer 1 deterministic validation (duplicates, state mismatches)
 python layer1_validation.py
+```
 
-# Step 3: Run Layer 2 statistical anomaly detection (Z-scores, rolling spikes, IQR)
+## 3. Run Layer 2
+
+```bash
 python layer2_statistical.py
+```
 
-# Step 4: Run Layer 3 deterministic vendor risk scoring (composite index & tiers)
+## 4. Run Layer 3
+
+```bash
 python layer3_scoring.py
+```
 
-# Step 5: Run Layer 4 Gemini AI risk narrative generation (Optional)
-python ai_risk_narrative.py
+## 5. Check Layer 4 without making API calls
 
-# Step 6: Export all processed datasets for Tableau
+```bash
+python ai_risk_narrative.py --dry-run
+```
+
+## 6. Run a controlled AI test
+
+```bash
+python ai_risk_narrative.py --limit 1
+```
+
+## 7. Generate the Tableau exports
+
+```bash
 python export.py
 ```
 
----
-
-## 🧪 Automated Testing
-
-The automated test suite verifies prompt construction, tier filtering, schema validation, non-blocking resilience, score immutability, and credential redaction using mocked Gemini and PostgreSQL clients.
-
-Execute tests using pytest:
-
-```bash
-pytest -v
-```
-
-### Verified Test Results (11 Passed, 0 Failed)
+The resulting CSV files are written to:
 
 ```text
-tests/test_ai_risk_narrative.py::test_valid_gemini_structured_response PASSED     [  9%]
-tests/test_ai_risk_narrative.py::test_missing_api_key PASSED                     [ 18%]
-tests/test_ai_risk_narrative.py::test_gemini_api_failure PASSED                  [ 27%]
-tests/test_ai_risk_narrative.py::test_malformed_json_response PASSED             [ 36%]
-tests/test_ai_risk_narrative.py::test_schema_validation_failure PASSED           [ 45%]
-tests/test_ai_risk_narrative.py::test_high_only_filtering PASSED                 [ 54%]
-tests/test_ai_risk_narrative.py::test_db_fetch_filters_high_only PASSED          [ 63%]
-tests/test_ai_risk_narrative.py::test_high_and_medium_filtering PASSED           [ 72%]
-tests/test_ai_risk_narrative.py::test_deterministic_risk_score_remains_unchanged PASSED [ 81%]
-tests/test_ai_risk_narrative.py::test_ai_narrative_stored_separately PASSED         [ 90%]
-tests/test_ai_risk_narrative.py::test_no_secret_exposed_in_logs PASSED           [100%]
-
-============================= 11 passed in 5.63s ==============================
+tableau_exports/
 ```
 
 ---
 
-## ⚡ Failure Behavior & System Resilience
+# Database Design
 
-Layer 4 is architected with strict resilience guarantees to prevent downstream reporting interruptions:
+The project separates deterministic risk calculations from AI-generated explanations.
 
-- **Missing API Key**: If `GEMINI_API_KEY` is not configured, Layer 4 gracefully logs a warning and exits cleanly. Upstream Layers 1–3 and existing exports remain 100% operational.
-- **API Availability & Rate Limits**: Transient HTTP errors, timeouts, or 429 rate limits are trapped per-vendor. The system logs the failure and proceeds to the next vendor.
-- **Malformed LLM Output**: Non-JSON responses or outputs violating the Pydantic schema are discarded rather than contaminating the database.
-- **Database Resilience**: Write errors during narrative insertion do not touch or roll back `vendor_risk_scores`.
-- **Log Sanitization**: All error logging passes through `sanitize_log_message(...)`, redacting API keys, passwords, and tokens before terminal output.
+Conceptually:
+
+```text
+Invoice Data
+    │
+    ├── Layer 1 validation
+    │
+    └── Layer 2 anomaly detection
+              │
+              ▼
+       Vendor Risk Scores
+              │
+              ├── risk_tier
+              ├── composite_score
+              ├── anomaly signals
+              └── validation signals
+                       │
+                       ▼
+              AI Risk Narratives
+                       │
+                       ├── risk_summary
+                       ├── key_drivers
+                       ├── investigation_priorities
+                       └── evidence
+```
+
+The AI narrative data is stored separately from the authoritative vendor risk scores.
+
+This prevents the AI layer from overwriting deterministic risk calculations.
 
 ---
 
-## 💡 Key SQL Techniques
+# Data Integrity
 
-### 1. Vendor Baseline Deviation (Z-Score)
-```sql
-WITH vendor_stats AS (
-    SELECT
-        vendor_id,
-        AVG(amount)    OVER (PARTITION BY vendor_id) AS baseline,
-        STDDEV(amount) OVER (PARTITION BY vendor_id) AS std_dev,
-        amount,
-        invoice_id
-    FROM invoices
-    WHERE validation_status = 'CLEAN'
-)
-SELECT invoice_id, vendor_id, amount, baseline, std_dev,
-       (amount - baseline) / NULLIF(std_dev, 0) AS z_score
-FROM vendor_stats
-WHERE (amount - baseline) / NULLIF(std_dev, 0) > 2
-ORDER BY z_score DESC;
+The Tableau integration was designed to preserve the underlying data model.
+
+Verified baseline values include:
+
+```text
+Total Orders      : 50,000
+Total Amount      : ₹17.754B
+Flagged Orders    : 7,881
+Flag Rate         : 15.76%
+Vendor Records    : 210
+AI Narratives     : 32
 ```
 
-### 2. Trailing 30-Invoice Rolling Average
-```sql
-SELECT
-    invoice_id,
-    vendor_id,
-    amount,
-    invoice_date,
-    AVG(amount) OVER (
-        PARTITION BY vendor_id
-        ORDER BY invoice_date
-        ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
-    ) AS rolling_avg
-FROM invoices
-WHERE validation_status = 'CLEAN';
-```
-
-### 3. Category-Level Interquartile Range (IQR) Fencing
-```sql
-WITH category_iqr AS (
-    SELECT
-        category_id,
-        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount) AS q1,
-        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY amount) AS q3
-    FROM invoices
-    WHERE validation_status = 'CLEAN'
-    GROUP BY category_id
-)
-SELECT i.invoice_id, i.vendor_id, i.amount,
-       c.q3 + 1.5 * (c.q3 - c.q1) AS upper_fence
-FROM invoices i
-JOIN category_iqr c ON i.category_id = c.category_id
-WHERE i.validation_status = 'CLEAN'
-  AND i.amount > (c.q3 + 1.5 * (c.q3 - c.q1));
-```
+The AI relationship is based on `vendor_id` and does not physically duplicate the invoice-level data.
 
 ---
 
-## 🔒 Security Best Practices
+# Security
 
-- **Zero Hardcoded Secrets**: All database connection parameters and API keys are loaded via `python-dotenv`.
-- **Git Hygiene**: `.env` and `.env.*` are excluded via `.gitignore`; `.env.example` provides non-sensitive template defaults.
-- **Credential Masking**: Regex sanitizers scrub sensitive strings from application logs and console outputs.
-- **Git History Notice**: Hardcoded credentials committed in historical repository revisions (`cfc3de2...`) were eliminated from all current source files and must be purged with history-cleaning tools before public mirroring.
+Sensitive configuration is loaded through environment variables.
+
+The repository includes:
+
+```text
+.env.example
+```
+
+but the actual:
+
+```text
+.env
+```
+
+file is ignored by Git.
+
+API credentials and database passwords should never be committed to the repository.
+
+If a credential has previously been exposed in Git history, it should be rotated even after the current working tree has been cleaned.
 
 ---
 
-## 👤 Author
+# Design Principles
+
+### Deterministic risk calculation
+
+Risk scores and tiers are calculated by explicit rules rather than generated by an LLM.
+
+### Explainability
+
+AI output is generated from existing risk signals rather than replacing the underlying analytical model.
+
+### Separation of concerns
+
+```text
+Detection
+    ↓
+Scoring
+    ↓
+Explanation
+    ↓
+Visualization
+```
+
+Each stage has a clearly defined responsibility.
+
+### Reproducibility
+
+The same validated inputs and scoring rules produce deterministic Layer 3 results.
+
+### Resumability
+
+Layer 4 can stop and resume without rebuilding successful narratives.
+
+### Auditability
+
+The AI layer retains the underlying evidence and deterministic score used to generate each narrative.
+
+---
+
+# Project Outcome
+
+The final system combines:
+
+```text
+50K+ invoices
+      ↓
+Rule-based validation
+      ↓
+Statistical anomaly detection
+      ↓
+Deterministic vendor risk scoring
+      ↓
+32 HIGH-risk vendor narratives
+      ↓
+Interactive Tableau dashboard
+```
+
+The result is an end-to-end analytical workflow that connects **data quality, anomaly detection, risk scoring, AI-assisted explanation, and business visualization** in a single project.
+
+---
+
+## Dashboard
+
+The repository includes the packaged Tableau workbook:
+
+```text
+dashboard.twbx
+```
+
+and a dashboard preview:
+
+```text
+dashboard.png
+```
+
+The Tableau dashboard provides interactive vendor risk analysis and an AI-generated narrative panel driven by the selected vendor.
+
+---
+
+## Author
 
 **Kumar Saksham**
 
-- **GitHub**: [@Saksham3124](https://github.com/Saksham3124)
-- **LinkedIn**: [Kumar Saksham](https://www.linkedin.com/in/kumar-saksham-94b150257/)
-- **Tableau Public**: [Kumar Saksham Profile](https://public.tableau.com/app/profile/kumar.saksham2703/viz/GST__/Dashboard1)
-- **Repository**: [gst-invoice-anomaly-detection](https://github.com/Saksham3124/gst-invoice-anomaly-detection)
+B.Tech — Electronics & Communication Engineering  
+Birla Institute of Technology, Mesra
+
+**GitHub:**  
+https://github.com/Saksham3124
+
+**Portfolio:**  
+https://kumarsaksham.vercel.app/
+
+**LinkedIn:**  
+https://www.linkedin.com/in/kumarsaksham/
