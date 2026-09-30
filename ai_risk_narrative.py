@@ -17,7 +17,9 @@ CRITICAL DESIGN PRINCIPLES:
 import json
 import logging
 import os
+import random
 import re
+import time
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
@@ -48,6 +50,17 @@ def sanitize_log_message(msg: Any) -> str:
     # Redact user credentials in database URIs
     text = re.sub(r':([^:@\s]+)@', ':***@', text)
     return text
+
+# ── Run-Level & Narrative Status Constants ───────────────────────────
+
+class NarrativeStatus:
+    SUCCESS = "SUCCESS"
+    TRANSIENT_FAILURE = "TRANSIENT_FAILURE"
+    PERMANENT_FAILURE = "PERMANENT_FAILURE"
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
+    SKIPPED_VALID = "SKIPPED_VALID"
+    DEFERRED = "DEFERRED"
+
 
 # ── Pydantic Schema for Structured Response ──────────────────────────
 
@@ -157,6 +170,80 @@ def init_narrative_table(conn) -> None:
     conn.commit()
 
 
+def is_daily_quota_exhausted(err_msg: str) -> bool:
+    """Detect whether an error message indicates daily/project/free-tier quota exhaustion."""
+    lower = err_msg.lower()
+    daily_markers = (
+        "generate_content_free_tier_requests",
+        "generaterequestsperday",
+        "requests per day",
+        "daily quota",
+        "limit: 20",
+        "quotafailure",
+    )
+    return any(marker in lower for marker in daily_markers)
+
+
+def fetch_existing_narratives(conn) -> Dict[int, Dict[str, Any]]:
+    """Fetch existing valid narratives from the database mapped by vendor_id."""
+    query = """
+        SELECT
+            vendor_id,
+            risk_tier,
+            composite_score,
+            risk_summary,
+            model_name,
+            generated_at
+        FROM ai_risk_narratives
+        WHERE risk_summary IS NOT NULL
+          AND TRIM(risk_summary) != ''
+          AND risk_tier IS NOT NULL
+          AND composite_score IS NOT NULL;
+    """
+    existing = {}
+    with conn.cursor() as cur:
+        cur.execute(query)
+        for row in cur.fetchall():
+            existing[row[0]] = {
+                "vendor_id": row[0],
+                "risk_tier": row[1],
+                "composite_score": float(row[2]) if row[2] is not None else 0.0,
+                "risk_summary": row[3],
+                "model_name": row[4],
+                "generated_at": row[5],
+            }
+    return existing
+
+
+def is_narrative_valid_for_vendor(
+    existing_record: Optional[Dict[str, Any]],
+    vendor_data: Dict[str, Any]
+) -> bool:
+    """Compare stored narrative against current Layer 3 values.
+
+    Returns True ONLY if stored risk_tier and composite_score match Layer 3.
+    If Layer 3 scores have changed, returns False so narrative is regenerated.
+    """
+    if not existing_record:
+        return False
+
+    stored_tier = str(existing_record.get("risk_tier", "")).strip().upper()
+    current_tier = str(vendor_data.get("risk_tier", "")).strip().upper()
+
+    try:
+        stored_score = round(float(existing_record.get("composite_score", 0.0)), 2)
+        current_score = round(float(vendor_data.get("composite_score", 0.0)), 2)
+    except (ValueError, TypeError):
+        return False
+
+    summary = existing_record.get("risk_summary")
+    if not summary or not summary.strip():
+        return False
+
+    # Stored tier and score must strictly match authoritative Layer 3 data
+    return (stored_tier == current_tier) and (abs(stored_score - current_score) < 0.01)
+
+
 def fetch_vendors_for_narrative(conn, tiers: List[str]) -> List[Dict[str, Any]]:
     """Fetch deterministic vendor risk scoring results and flag evidence from DB."""
     query = """
@@ -233,53 +320,112 @@ def fetch_vendors_for_narrative(conn, tiers: List[str]) -> List[Dict[str, Any]]:
 def generate_vendor_narrative(
     client: Any,
     vendor_data: Dict[str, Any],
-    model_name: str
+    model_name: str,
+    retries: int = 3,
+    error_out: Optional[Dict[str, Any]] = None,
 ) -> Optional[RiskNarrative]:
-    """Call Gemini to generate a structured risk narrative for a vendor."""
+    """Call Gemini to generate a structured risk narrative for a vendor with bounded retries."""
     from google.genai import types
 
     user_prompt = build_user_prompt(vendor_data)
+    vid = vendor_data.get("vendor_id")
 
-    try:
-        config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            response_schema=RiskNarrative,
-            temperature=0.2,
-        )
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=user_prompt,
-            config=config,
-        )
-
-        raw_text = getattr(response, "text", None)
-        if not raw_text:
-            logger.warning(
-                f"Empty response from Gemini for vendor {vendor_data.get('vendor_id')}."
+    for attempt in range(1, retries + 1):
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=RiskNarrative,
+                temperature=0.2,
             )
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_prompt,
+                config=config,
+            )
+
+            raw_text = getattr(response, "text", None)
+            if not raw_text:
+                logger.warning(f"Empty response from Gemini for vendor {vid}.")
+                if error_out is not None:
+                    error_out["error_type"] = "other"
+                    error_out["message"] = "Empty response"
+                return None
+
+            # Parse and validate with Pydantic
+            narrative = RiskNarrative.model_validate_json(raw_text)
+            if error_out is not None:
+                error_out["error_type"] = "none"
+            return narrative
+
+        except ValidationError as ve:
+            logger.error(f"Schema validation failed for vendor {vid}: {sanitize_log_message(ve)}")
+            if error_out is not None:
+                error_out["error_type"] = "other"
+                error_out["message"] = "Schema validation error"
             return None
+        except json.JSONDecodeError as je:
+            logger.error(f"Malformed JSON returned for vendor {vid}: {sanitize_log_message(je)}")
+            if error_out is not None:
+                error_out["error_type"] = "other"
+                error_out["message"] = "Malformed JSON"
+            return None
+        except Exception as e:
+            err_msg = str(e)
 
-        # Parse and validate with Pydantic
-        narrative = RiskNarrative.model_validate_json(raw_text)
-        return narrative
+            # Check for Daily Quota Exhaustion FIRST — fail fast without retrying
+            if is_daily_quota_exhausted(err_msg):
+                logger.warning(
+                    f"Daily Gemini quota exhausted for vendor {vid}: {sanitize_log_message(e)}"
+                )
+                print(f"  429 RESOURCE_EXHAUSTED — daily quota exhausted")
+                if error_out is not None:
+                    error_out["error_type"] = "429_QUOTA_EXHAUSTED"
+                    error_out["status"] = NarrativeStatus.QUOTA_EXHAUSTED
+                    error_out["message"] = "Daily Gemini quota exhausted"
+                return None
 
-    except ValidationError as ve:
-        logger.error(
-            f"Schema validation failed for vendor {vendor_data.get('vendor_id')}: {sanitize_log_message(ve)}"
-        )
-        return None
-    except json.JSONDecodeError as je:
-        logger.error(
-            f"Malformed JSON returned for vendor {vendor_data.get('vendor_id')}: {sanitize_log_message(je)}"
-        )
-        return None
-    except Exception as e:
-        logger.error(
-            f"Gemini API invocation failed for vendor {vendor_data.get('vendor_id')}: {sanitize_log_message(e)}"
-        )
-        return None
+            is_429 = any(code in err_msg for code in ("429", "RESOURCE_EXHAUSTED", "Quota exceeded", "Too Many Requests"))
+            is_503 = any(code in err_msg for code in ("503", "UNAVAILABLE", "Service Unavailable", "overloaded"))
+            is_permanent = any(code in err_msg for code in ("400", "401", "403", "404", "INVALID_ARGUMENT", "PERMISSION_DENIED", "NOT_FOUND"))
+
+            # Determine error type for metrics
+            err_category = "429" if is_429 else ("503" if is_503 else "other")
+            err_label = "429 TooManyRequests" if is_429 else ("503 ServiceUnavailable" if is_503 else "OtherError")
+            if error_out is not None:
+                error_out["error_type"] = err_category
+                error_out["status"] = NarrativeStatus.PERMANENT_FAILURE if is_permanent else NarrativeStatus.TRANSIENT_FAILURE
+                error_out["message"] = sanitize_log_message(e)
+
+            # Permanent errors: fail immediately without retrying
+            if is_permanent or (not is_429 and not is_503):
+                logger.error(f"Gemini API invocation failed for vendor {vid}: {sanitize_log_message(e)}")
+                return None
+
+            # Retryable errors (temporary 429, 503)
+            if attempt < retries:
+                if "PYTEST_CURRENT_TEST" in os.environ:
+                    delay = 0.01
+                else:
+                    # Bounded exponential backoff with jitter:
+                    # attempt 1 -> ~2s (2.0 + 0.1-0.5s)
+                    # attempt 2 -> ~5s (5.0 + 0.2-1.0s)
+                    base_delay = 2.0 if attempt == 1 else 5.0
+                    jitter = random.uniform(0.1, 0.5) if attempt == 1 else random.uniform(0.2, 1.0)
+                    delay = round(base_delay + jitter, 2)
+
+                logger.warning(
+                    f"Transient error on attempt {attempt}/{retries} for vendor {vid}: {err_label}. Retrying in {delay}s..."
+                )
+                print(f"  {err_label} — retry {attempt}/{retries - 1}")
+                time.sleep(delay)
+                continue
+            else:
+                logger.error(
+                    f"Gemini API invocation failed for vendor {vid}: {sanitize_log_message(e)}"
+                )
+                return None
 
 
 def store_narrative(
@@ -320,46 +466,37 @@ def run_layer4(
     conn=None,
     api_key: Optional[str] = None,
     model_name: Optional[str] = None,
-    risk_tiers: Optional[str] = None
+    risk_tiers: Optional[str] = None,
+    limit: Optional[int] = None,
+    dry_run: bool = False,
 ) -> List[Dict[str, Any]]:
     """Execute Layer 4: AI Risk Narrative Generation.
 
     This function is fully fail-safe: any failure in API key resolution,
     Gemini communication, or database operations is captured, logged,
     and returns gracefully without throwing exceptions or corrupting
-    upstream results.
+    upstream results. Supports resumable execution and dry-run mode.
     """
     print("=" * 50)
     print("LAYER 4 — AI RISK NARRATIVE (GEMINI DECISION-SUPPORT)")
     print("=" * 50)
 
-    # 1. Resolve API Key
-    effective_api_key = api_key or os.getenv("GEMINI_API_KEY")
-    if not effective_api_key or effective_api_key.strip() == "":
-        logger.warning(
-            "GEMINI_API_KEY is not set. Skipping AI risk narrative generation. "
-            "Upstream deterministic scores remain authoritative and unaffected."
-        )
-        print("⚠️  GEMINI_API_KEY missing. Layer 4 skipped gracefully.")
-        return []
-
-    # 2. Resolve Model and Tiers
-    effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    # 1. Resolve Target Tiers and Model
+    effective_model = model_name or os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     target_tiers = parse_risk_tiers(risk_tiers)
+    effective_limit = limit if limit is not None else (
+        int(os.getenv("AI_VENDOR_LIMIT")) if os.getenv("AI_VENDOR_LIMIT") else None
+    )
+
     print(f"  Configuration:")
     print(f"    Model       : {effective_model}")
     print(f"    Target Tiers: {', '.join(target_tiers)}")
+    if effective_limit:
+        print(f"    Batch Limit : {effective_limit} unprocessed vendor(s)")
+    if dry_run:
+        print(f"    Mode        : DRY RUN (no API calls, no DB changes)")
 
-    # 3. Initialize Gemini Client
-    try:
-        from google import genai
-        client = genai.Client(api_key=effective_api_key)
-    except Exception as e:
-        logger.error(f"Failed to initialize Gemini client: {sanitize_log_message(e)}")
-        print(f"⚠️  Could not initialize Gemini client: {sanitize_log_message(e)}. Skipping Layer 4.")
-        return []
-
-    # 4. Resolve Database Connection
+    # 2. Resolve Database Connection
     should_close_conn = False
     if conn is None:
         try:
@@ -387,10 +524,62 @@ def run_layer4(
     try:
         init_narrative_table(conn)
         vendors = fetch_vendors_for_narrative(conn, target_tiers)
-        print(f"\n  Found {len(vendors)} vendor(s) matching tier(s) {target_tiers} for narrative generation.")
+        existing_narratives = fetch_existing_narratives(conn)
 
-        success_count = 0
-        failure_count = 0
+        total_eligible = len(vendors)
+        already_valid_count = sum(
+            1 for v in vendors
+            if is_narrative_valid_for_vendor(existing_narratives.get(v["vendor_id"]), v)
+        )
+        remaining_to_generate = total_eligible - already_valid_count
+
+        # ── Handle Dry Run ───────────────────────────────────────────
+        if dry_run:
+            print("\n" + "=" * 50)
+            print("LAYER 4 DRY RUN — GEMINI RISK NARRATIVE")
+            print("=" * 50)
+            print(f"  Target tiers              : {', '.join(target_tiers)}")
+            print(f"  Eligible {target_tiers[0] if target_tiers else 'HIGH'}-risk vendors: {total_eligible}")
+            print(f"  Existing valid narratives : {already_valid_count}")
+            print(f"  Remaining to generate     : {remaining_to_generate}")
+            if effective_limit:
+                print(f"  Would process (limit)     : {min(effective_limit, remaining_to_generate)}")
+            print("=" * 50)
+            print("✅ Dry run complete. No Gemini API requests made. No database records modified.")
+            return []
+
+        # ── Resolve API Key for Live Execution ───────────────────────
+        effective_api_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY")
+        if not effective_api_key or effective_api_key.strip() == "":
+            logger.warning(
+                "GEMINI_API_KEY is not set. Skipping AI risk narrative generation. "
+                "Upstream deterministic scores remain authoritative and unaffected."
+            )
+            print("⚠️  GEMINI_API_KEY missing. Layer 4 skipped gracefully.")
+            return []
+
+        # Initialize Gemini Client
+        try:
+            from google import genai
+            client = genai.Client(api_key=effective_api_key)
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini client: {sanitize_log_message(e)}")
+            print(f"⚠️  Could not initialize Gemini client: {sanitize_log_message(e)}. Skipping Layer 4.")
+            return []
+
+        print(f"\nLayer 4 — Gemini Risk Narrative")
+        print(f"  Target tiers              : {', '.join(target_tiers)}")
+        print(f"  Eligible vendors          : {total_eligible}")
+        print(f"  Existing valid narratives : {already_valid_count}")
+        print(f"  Remaining vendors         : {remaining_to_generate}")
+
+        attempted_this_run = 0
+        successful_this_run = 0
+        failed_this_run = 0
+        deferred_this_run = 0
+        already_processed_count = 0
+        error_counts = {"429": 0, "503": 0, "other": 0}
+        stop_reason = "All requested vendors processed"
 
         for idx, vendor in enumerate(vendors, 1):
             vid = vendor["vendor_id"]
@@ -398,13 +587,39 @@ def run_layer4(
             score = vendor["composite_score"]
             tier = vendor["risk_tier"]
 
-            print(f"  [{idx}/{len(vendors)}] Generating narrative for Vendor {vid} ({vname}) - Score: {score} [{tier}]...")
-            narrative = generate_vendor_narrative(client, vendor, effective_model)
+            # 1. Check if an existing narrative is already valid for this vendor (Resumability)
+            if is_narrative_valid_for_vendor(existing_narratives.get(vid), vendor):
+                already_processed_count += 1
+                print(f"\n[{idx}/{total_eligible}] Vendor {vid} ({vname}) — existing narrative found, SKIP")
+                continue
+
+            # If existing narrative had score/tier mismatch, log regeneration reason
+            if vid in existing_narratives:
+                old = existing_narratives[vid]
+                print(f"\n[{idx}/{total_eligible}] Vendor {vid} ({vname}) — Layer 3 state changed (stored {old['composite_score']}/{old['risk_tier']} != current {score}/{tier}), REGENERATE")
+
+            # 2. Check --limit on unprocessed vendors
+            if effective_limit is not None and attempted_this_run >= effective_limit:
+                stop_reason = f"Batch limit of {effective_limit} unprocessed vendor(s) reached"
+                break
+
+            # 3. Process vendor
+            attempted_this_run += 1
+            print(f"\n[{idx}/{total_eligible}] Vendor {vid} ({vname}) — generating narrative")
+            err_info = {}
+            narrative = generate_vendor_narrative(
+                client=client,
+                vendor_data=vendor,
+                model_name=effective_model,
+                retries=3,
+                error_out=err_info,
+            )
 
             if narrative:
                 try:
                     store_narrative(conn, vendor, narrative, effective_model)
-                    success_count += 1
+                    successful_this_run += 1
+                    print(f"[{idx}/{total_eligible}] SUCCESS")
                     results.append({
                         "vendor_id": vid,
                         "vendor_name": vname,
@@ -414,17 +629,47 @@ def run_layer4(
                     })
                 except Exception as store_err:
                     logger.error(f"Failed to store narrative for vendor {vid}: {sanitize_log_message(store_err)}")
-                    failure_count += 1
+                    failed_this_run += 1
+                    error_counts["other"] += 1
+                    print(f"[{idx}/{total_eligible}] FAILED — storage error")
             else:
-                failure_count += 1
+                err_type = err_info.get("error_type")
+                status = err_info.get("status")
+
+                if status == NarrativeStatus.QUOTA_EXHAUSTED or err_type == "429_QUOTA_EXHAUSTED":
+                    deferred_this_run += 1
+                    error_counts["429"] += 1
+                    stop_reason = "Daily Gemini quota exhausted"
+                    print(f"[{idx}/{total_eligible}] DEFERRED — daily quota exhausted")
+                    print("\nLayer 4 stopping safely. No additional API requests will be attempted today.")
+                    break
+                else:
+                    failed_this_run += 1
+                    err_cat = "429" if err_type == "429" else ("503" if err_type == "503" else "other")
+                    error_counts[err_cat] += 1
+                    print(f"[{idx}/{total_eligible}] FAILED")
+
+            # Sequential pacing delay between vendors (skipped in tests)
+            if idx < total_eligible and "PYTEST_CURRENT_TEST" not in os.environ:
+                delay = float(os.getenv("AI_REQUEST_DELAY", "2.0"))
+                time.sleep(delay)
+
+        total_stored_narratives = already_processed_count + successful_this_run
+        remaining_unprocessed = total_eligible - total_stored_narratives
 
         print("\n" + "=" * 50)
-        print("LAYER 4 SUMMARY")
+        print("Layer 4 complete / stopped")
         print("=" * 50)
-        print(f"  Target Vendors Evaluated: {len(vendors)}")
-        print(f"  Narratives Generated    : {success_count}")
-        print(f"  Failed / Skipped        : {failure_count}")
-        print("✅ Layer 4 execution complete.")
+        print(f"  Eligible                : {total_eligible}")
+        print(f"  Already processed       : {already_processed_count}")
+        print(f"  Attempted this run      : {attempted_this_run}")
+        print(f"  Successful this run     : {successful_this_run}")
+        print(f"  Failed this run         : {failed_this_run}")
+        print(f"  Deferred                : {deferred_this_run}")
+        print(f"  Total narratives stored : {total_stored_narratives}")
+        print(f"  Remaining               : {remaining_unprocessed}")
+        print(f"  Reason stopped          : {stop_reason}")
+        print("=" * 50)
 
     except Exception as e:
         logger.error(f"Unexpected error during Layer 4 pipeline execution: {sanitize_log_message(e)}")
@@ -440,4 +685,17 @@ def run_layer4(
 
 
 if __name__ == "__main__":
-    run_layer4()
+    import argparse
+    parser = argparse.ArgumentParser(description="Layer 4 AI Risk Narrative Generation")
+    parser.add_argument("--limit", type=int, default=None, help="Maximum number of unprocessed vendors to process")
+    parser.add_argument("--tiers", type=str, default=None, help="Comma-separated risk tiers (default: HIGH)")
+    parser.add_argument("--model", type=str, default=None, help="Gemini model name")
+    parser.add_argument("--dry-run", action="store_true", help="Perform dry run without calling Gemini or modifying DB")
+    cli_args = parser.parse_args()
+
+    run_layer4(
+        model_name=cli_args.model,
+        risk_tiers=cli_args.tiers,
+        limit=cli_args.limit,
+        dry_run=cli_args.dry_run,
+    )
