@@ -123,9 +123,9 @@ Layer 1 identifies transactional integrity issues:
 
 Layer 2 identifies behavioral anomalies using PostgreSQL analytical SQL:
 
-* **Vendor Z-Score** — detects transactions significantly above vendor baselines
-* **30-invoice rolling average** — detects sudden vendor-level volume spikes
-* **IQR analysis** — identifies category-level transaction outliers
+* **Vendor Z-Score:** Detects transactions significantly above vendor baselines
+* **30-invoice rolling average:** Detects sudden vendor-level volume spikes
+* **IQR analysis:** Identifies category-level transaction outliers
 
 ---
 
@@ -393,7 +393,6 @@ pytest -v
 * **LinkedIn:** [Kumar Saksham](https://www.linkedin.com/in/kumarsaksham/)
 * **Tableau:** [Kumar Saksham](https://public.tableau.com/app/profile/kumar.saksham2703/)
 * **Live Dashboard:** [GST Invoice Risk Dashboard](https://public.tableau.com/app/profile/kumar.saksham2703/viz/GST__/Dashboard1)
-
 
 ---
 
